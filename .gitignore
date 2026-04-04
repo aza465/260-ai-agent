@@ -1,0 +1,7 @@
+.env
+credentials.json
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+agent.log
