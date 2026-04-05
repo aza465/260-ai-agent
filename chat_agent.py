@@ -841,7 +841,7 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "query_shopify_analytics",
-        "description": "Queries Shopify analytics using ShopifyQL. This is the PRIMARY source for vendor sales data. Syntax rules: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE [date] UNTIL [date] WITH TIMEZONE 'America/New_York'. Use SHOW not SELECT. Use GROUP BY not BY. Use SINCE/UNTIL not WHERE for dates. Valid metrics: net_sales, gross_sales, orders. Valid dimensions: product_vendor, day, week, month. Example: FROM sales SHOW net_sales, gross_sales, orders GROUP BY product_vendor SINCE 2026-04-01 UNTIL 2026-04-05 WITH TIMEZONE 'America/New_York'",
+        "description": "Queries Shopify analytics using ShopifyQL. This is the PRIMARY source for vendor sales data. Syntax rules: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE [date] UNTIL [date] WITH TIMEZONE 'America/New_York'. Use SHOW not SELECT. Use GROUP BY not BY. Use SINCE/UNTIL not WHERE for dates. Valid metrics: net_sales, gross_sales, orders. Valid dimensions: product_vendor, day, week, month. Example: FROM sales SHOW net_sales, gross_sales, orders GROUP BY product_vendor SINCE 2026-04-01 UNTIL 2026-04-05 WITH TIMEZONE 'America/New_York'. IMPORTANT: Always exclude product_vendor = 'ShipInsure' from results — it is a shipping add-on, not a brand.",
         "input_schema": {"type": "object", "properties": {"shopify_ql": {"type": "string", "description": "A valid ShopifyQL query string"}}, "required": ["shopify_ql"]}
     },
     {
@@ -1249,7 +1249,10 @@ Key tables: Tasks, Requests, Inventory, Projects, Brands.
 
 ## DATA TOOLS
 - **Shopify (ShopifyQL)**: PRIMARY source for vendor sales — net_sales, gross_sales, orders grouped by
-  product_vendor. Syntax: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE/UNTIL [dates] WITH TIMEZONE 'America/New_York'
+  product_vendor. Syntax: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE/UNTIL [dates] WITH TIMEZONE 'America/New_York'.
+  Always exclude 'ShipInsure' from vendor results — it is a shipping protection add-on, not a brand.
+  'Inner Circle' is the 260 loyalty program — exclude from sales/vendor reporting. It does appear in
+  Shopify data as line pass and VIP pass purchases which are relevant for event operations context.
 - **BigQuery**: POS and historical data — `pos_data.teamwork_transactions` (in-store POS by location/product/date).
   Note: shopify_data.vendor_performance columns are currently unpopulated — use ShopifyQL for vendor sales.
 - **Google Analytics 4** (Property: 329727471): Web traffic, traffic sources, top pages, conversions,
