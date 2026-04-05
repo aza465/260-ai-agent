@@ -1446,7 +1446,7 @@ if __name__ == "__main__":
     subscriber = pubsub_v1.SubscriberClient()
     subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
 
-    mode = "Hybrid (Local + Claude)" if USE_LOCAL_LLM else "Claude API only"
+    mode = f"Haiku ({CLAUDE_HAIKU_MODEL}) + Sonnet ({CLAUDE_SONNET_MODEL})"
     memory = "ChromaDB enabled" if CHROMA_ENABLED else "in-memory only"
     logger.info(f"--- Agent LIVE | Mode: {mode} | Memory: {memory} ---")
 
