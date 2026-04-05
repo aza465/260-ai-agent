@@ -836,12 +836,12 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "run_bigquery_report",
-        "description": "Executes SQL against BigQuery. Tables: (1) shopify_data.vendor_performance — vendor/date/net_sales/units_sold/order_count. (2) pos_data.teamwork_transactions — Teamwork POS transactions by location/product/date. Always use LIMIT clauses.",
+        "description": "Executes SQL against BigQuery for historical data. NOTE: shopify_data.vendor_performance columns are currently unpopulated — use query_shopify_analytics instead for vendor sales. Table (2) pos_data.teamwork_transactions has columns: location, product_name, vendor, quantity, net_sales, transaction_date. Always use full table path with project: `gen-lang-client-0065509773.dataset.table`. Always use LIMIT clauses.",
         "input_schema": {"type": "object", "properties": {"sql_query": {"type": "string", "description": "Valid BigQuery Standard SQL query string"}}, "required": ["sql_query"]}
     },
     {
         "name": "query_shopify_analytics",
-        "description": "Queries Shopify analytics using ShopifyQL. Use SHOW (not SELECT), SINCE/UNTIL for dates (not WHERE), and always end with WITH TIMEZONE 'America/New_York'. Valid columns: net_sales, gross_sales, orders, product_vendor.",
+        "description": "Queries Shopify analytics using ShopifyQL. This is the PRIMARY source for vendor sales data. Syntax rules: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE [date] UNTIL [date] WITH TIMEZONE 'America/New_York'. Use SHOW not SELECT. Use GROUP BY not BY. Use SINCE/UNTIL not WHERE for dates. Valid metrics: net_sales, gross_sales, orders. Valid dimensions: product_vendor, day, week, month. Example: FROM sales SHOW net_sales, gross_sales, orders GROUP BY product_vendor SINCE 2026-04-01 UNTIL 2026-04-05 WITH TIMEZONE 'America/New_York'",
         "input_schema": {"type": "object", "properties": {"shopify_ql": {"type": "string", "description": "A valid ShopifyQL query string"}}, "required": ["shopify_ql"]}
     },
     {
@@ -1248,9 +1248,10 @@ When a brand is mentioned, check SmartSuite for their client profile and history
 Key tables: Tasks, Requests, Inventory, Projects, Brands.
 
 ## DATA TOOLS
-- **Shopify (ShopifyQL)**: Real-time event sales — net sales, gross sales, orders, UPT by vendor/date
-- **BigQuery**: Historical archive — `shopify_data.vendor_performance` (vendor/date/net_sales/units/orders)
-  and `pos_data.teamwork_transactions` (POS by location/product/date). Always use LIMIT clauses.
+- **Shopify (ShopifyQL)**: PRIMARY source for vendor sales — net_sales, gross_sales, orders grouped by
+  product_vendor. Syntax: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE/UNTIL [dates] WITH TIMEZONE 'America/New_York'
+- **BigQuery**: POS and historical data — `pos_data.teamwork_transactions` (in-store POS by location/product/date).
+  Note: shopify_data.vendor_performance columns are currently unpopulated — use ShopifyQL for vendor sales.
 - **Google Analytics 4** (Property: 329727471): Web traffic, traffic sources, top pages, conversions,
   and revenue. Use to understand digital demand signals before and during events.
 - **Web Search**: Brand research, market context, anything not in internal systems.
