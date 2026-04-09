@@ -1648,17 +1648,23 @@ When a brand is mentioned, check SmartSuite for their client profile and history
 Key tables: Tasks, Requests, Inventory, Projects, Brands.
 
 ## DATA TOOLS
-- **Shopify (ShopifyQL)**: PRIMARY source for vendor sales — net_sales, gross_sales, orders grouped by
-  product_vendor. Syntax: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE/UNTIL [dates] WITH TIMEZONE 'America/New_York'.
-  Always exclude 'ShipInsure' from vendor results — it is a shipping protection add-on, not a brand.
-  'Inner Circle' is the 260 loyalty program — exclude from sales/vendor reporting. It does appear in
-  Shopify data as line pass and VIP pass purchases which are relevant for event operations context.
-- **BI Report (run_bi_report)**: Combined in-store labor + sales KPI tool. Joins Teamwork Commerce POS
-  (chelsea-morning-prod-twc — 11.7M rows back to 2017, updated daily) with Deputy labor/payroll data.
-  Use for: labor cost %, sales per labor hour, staffing efficiency, store performance benchmarks.
+- **Shopify (query_shopify_analytics)**: PRIMARY source for ONLINE vendor sales — net_sales, gross_sales,
+  orders grouped by product_vendor. Syntax: FROM sales SHOW [metrics] GROUP BY [dimension] SINCE/UNTIL
+  [dates] WITH TIMEZONE 'America/New_York'. Always exclude 'ShipInsure' (shipping add-on) and
+  'Inner Circle' (loyalty program) from vendor results.
+- **In-Store POS (query_pos_sales)**: PRIMARY source for PHYSICAL store sales — queries Teamwork Commerce
+  BQ (11.7M rows back to 2017, updated daily). Use for any question about in-store performance,
+  store comparisons, or brand sales at physical locations. group_by options: 'location' (per store),
+  'brand' (per vendor), 'location_brand' (store+vendor detail), 'day', 'day_location'.
+  Default is by location. Filter by location_code or brand name.
+  STORE CODES: 001=260 Fifth, 002=261 5th Ave, 003=148 Lafayette, 004=477 Broome,
+  005=301 N Canon (Beverly Hills), 006=2151 Broadway, 008=468 Broadway,
+  009=Chicago, 010=Miami NW 2nd, 011=1517 3rd Ave, 012=Dallas, 013=Miami NW 23rd.
+- **BI Report (run_bi_report)**: Combined in-store labor + sales KPI tool. Joins Teamwork POS with
+  Deputy labor/payroll data. Use for: labor cost %, sales per labor hour, staffing efficiency.
   Requires date_from and date_to (YYYY-MM-DD). Optionally filter by location_code.
 - **BigQuery (run_bigquery_report)**: Ad-hoc queries against internal project (gen-lang-client-0065509773).
-  Note: shopify_data.vendor_performance is currently unpopulated — use ShopifyQL for vendor sales.
+  Note: shopify_data.vendor_performance is currently unpopulated — use query_shopify_analytics for vendor sales.
 - **Google Analytics 4** (Property: 329727471): Web traffic, traffic sources, top pages, conversions,
   and revenue. Use to understand digital demand signals before and during events.
 - **Web Search**: Brand research, market context, anything not in internal systems.
@@ -1836,26 +1842,32 @@ def fetch_shopify_data() -> dict:
 
 def fetch_bigquery_data() -> dict:
     """
-    Stage 2: Fetch yesterday's POS transactions from BigQuery.
+    Stage 2: Fetch yesterday's in-store POS sales by location from Teamwork Commerce BQ.
     Returns {"rows": [...], "date": "YYYY-MM-DD"} or {"error": "..."}.
     Verification: rows list must be non-empty.
     """
     logger.info("[PIPELINE] Stage 2 — fetch_bigquery_data() starting")
     yesterday = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
-    sql = (
-        f"SELECT location_name, vendor, product_name, quantity, net_amount "
-        f"FROM `gen-lang-client-0065509773.pos_data.teamwork_transactions` "
-        f"WHERE DATE(transaction_date) = '{yesterday}' "
-        f"ORDER BY net_amount DESC "
-        f"LIMIT 500"
-    )
+    if bi_bq_client is None:
+        logger.error("[PIPELINE] Stage 2 FAILED — BI BigQuery client not initialized")
+        return {"error": "BI BigQuery client not initialized"}
+    sql = f"""
+        SELECT
+          location.LocationCode  AS location_code,
+          location.LocationName  AS location_name,
+          ROUND(SUM(sale.NetSalesAmt), 2)               AS net_sales,
+          SUM(sale.Qty)                                  AS units,
+          COUNT(DISTINCT sale.UniversalNo)              AS transactions
+        FROM `chelsea-morning-prod-twc.external_datamart_1.all_SalesReceipt`
+        WHERE Date_Part = '{yesterday}'
+          AND sale.IsReturn = false
+          AND sale.RptIgnored = false
+        GROUP BY location_code, location_name
+        ORDER BY net_sales DESC
+    """
     try:
-        raw = run_bigquery_report(sql)
-        if raw.startswith("BigQuery Error"):
-            logger.error(f"[PIPELINE] Stage 2 FAILED — BigQuery error: {raw}")
-            return {"error": raw}
-        rows = json.loads(raw)
-        logger.info(f"[PIPELINE] Stage 2 COMPLETE — {len(rows)} POS rows fetched for {yesterday}")
+        rows = [dict(r) for r in bi_bq_client.query(sql).result()]
+        logger.info(f"[PIPELINE] Stage 2 COMPLETE — {len(rows)} locations fetched for {yesterday}")
         return {"rows": rows, "date": yesterday}
     except Exception as e:
         logger.error(f"[PIPELINE] Stage 2 FAILED — exception: {e}")
