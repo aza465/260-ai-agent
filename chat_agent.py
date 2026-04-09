@@ -78,6 +78,7 @@ TIER2_SIGNALS = [
     "basecamp", "smartsuite", "ga4", "analytics", "traffic", "inventory",
     "brand", "todo", "task", "request", "project", "search",
     "show me", "what are", "how many", "list", "check", "look up",
+    "in-store", "in store", "physical", "pos", "store", "location",
 ]
 CONVERSATIONAL_SIGNALS = [
     "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
@@ -167,6 +168,93 @@ def run_bigquery_report(sql_query: str):
     except Exception as e:
         return f"BigQuery Error: {str(e)}"
 
+
+def query_pos_sales(date_from: str, date_to: str, group_by: str = "location",
+                    location_code: str = None, brand: str = None):
+    """
+    Queries Teamwork Commerce POS data for physical in-store sales.
+    This is the in-store equivalent of query_shopify_analytics() — use for any
+    question about physical store performance, vendor/brand sales in-store,
+    or location-level comparisons.
+
+    date_from / date_to: YYYY-MM-DD
+    group_by: how to aggregate results
+      - "location"      → totals per store (default)
+      - "brand"         → totals per brand/vendor across all stores
+      - "location_brand"→ totals per store + brand (most detailed)
+      - "day"           → totals per day across all stores
+      - "day_location"  → totals per day per store
+
+    location_code: optional — filter to one store (e.g. "001", "005")
+    brand: optional — filter to one brand/vendor (e.g. "Reformation")
+
+    STORE CODES:
+    001=260 Fifth, 002=261 5th Ave, 003=148 Lafayette, 004=477 Broome,
+    005=301 N Canon (LA), 006=2151 Broadway, 008=468 Broadway,
+    009=1457 N Halsted (Chicago), 010=2450 NW 2nd (Miami),
+    011=1517 3rd Ave, 012=6030 Luther Lane (Dallas), 013=173 NW 23rd (Miami)
+
+    Returns: net_sales, gross_sales, units, transactions, ATV, AUR, UPT per group.
+    """
+    if bi_bq_client is None:
+        return "BI BigQuery client not initialized. Check BI_BIGQUERY_KEY_FILE in .env."
+
+    # Build SELECT and GROUP BY based on group_by param
+    group_map = {
+        "location":       ("location.LocationCode, location.LocationName",
+                           "location.LocationCode, location.LocationName"),
+        "brand":          ("item.Brand AS brand, item.PrimaryVendor AS vendor",
+                           "item.Brand, item.PrimaryVendor"),
+        "location_brand": ("location.LocationCode, location.LocationName, item.Brand AS brand",
+                           "location.LocationCode, location.LocationName, item.Brand"),
+        "day":            ("Date_Part AS date",
+                           "Date_Part"),
+        "day_location":   ("Date_Part AS date, location.LocationCode, location.LocationName",
+                           "Date_Part, location.LocationCode, location.LocationName"),
+    }
+    if group_by not in group_map:
+        return f"Invalid group_by '{group_by}'. Choose from: location, brand, location_brand, day, day_location"
+
+    select_dims, group_dims = group_map[group_by]
+
+    filters = [
+        f"Date_Part BETWEEN '{date_from}' AND '{date_to}'",
+        "sale.IsReturn = false",
+        "sale.RptIgnored = false",
+    ]
+    if location_code:
+        filters.append(f"location.LocationCode = '{location_code}'")
+    if brand:
+        filters.append(f"LOWER(item.Brand) LIKE LOWER('%{brand}%')")
+
+    where_clause = " AND ".join(filters)
+
+    sql = f"""
+    SELECT
+      {select_dims},
+      ROUND(SUM(sale.NetSalesAmt), 2)                               AS net_sales,
+      ROUND(SUM(sale.GrossSalesAmt), 2)                             AS gross_sales,
+      SUM(sale.Qty)                                                  AS units,
+      COUNT(DISTINCT sale.UniversalNo)                              AS transactions,
+      ROUND(SAFE_DIVIDE(SUM(sale.NetSalesAmt),
+            COUNT(DISTINCT sale.UniversalNo)), 2)                   AS atv,
+      ROUND(SAFE_DIVIDE(SUM(sale.NetSalesAmt), SUM(sale.Qty)), 2)  AS aur,
+      ROUND(SAFE_DIVIDE(SUM(sale.Qty),
+            COUNT(DISTINCT sale.UniversalNo)), 2)                   AS upt
+    FROM `chelsea-morning-prod-twc.external_datamart_1.all_SalesReceipt`
+    WHERE {where_clause}
+    GROUP BY {group_dims}
+    ORDER BY net_sales DESC
+    LIMIT 100
+    """
+    logger.info(f"[POS] Querying in-store sales {date_from}→{date_to} group_by={group_by}")
+    try:
+        results = list(bi_bq_client.query(sql).result())
+        logger.info(f"[POS] {len(results)} rows returned")
+        return json.dumps([dict(row) for row in results], default=str)
+    except Exception as e:
+        logger.error(f"[POS] Query error: {e}")
+        return f"POS Query Error: {str(e)}"
 
 def run_bi_report(date_from: str, date_to: str, location_code: str = None):
     """
@@ -980,6 +1068,7 @@ TOOL_DISPATCH_MAP = {
     "web_search":               web_search,
     "run_bigquery_report":      run_bigquery_report,
     "run_bi_report":            run_bi_report,
+    "query_pos_sales":          query_pos_sales,
     "query_shopify_analytics":  query_shopify_analytics,
     "list_basecamp_projects":        list_basecamp_projects,
     "get_project_tools":             get_project_tools,
@@ -1021,6 +1110,21 @@ TOOLS_SCHEMA = [
         "name": "run_bigquery_report",
         "description": "Executes SQL against the internal BigQuery project (gen-lang-client-0065509773) for ad-hoc queries. NOTE: shopify_data.vendor_performance is currently unpopulated — use query_shopify_analytics for vendor sales. Always use full table paths and LIMIT clauses.",
         "input_schema": {"type": "object", "properties": {"sql_query": {"type": "string", "description": "Valid BigQuery Standard SQL query string"}}, "required": ["sql_query"]}
+    },
+    {
+        "name": "query_pos_sales",
+        "description": "Queries Teamwork Commerce POS data for physical in-store sales. Use this for ANY question about in-store performance — vendor/brand sales by location, store comparisons, daily trends. Returns net_sales, gross_sales, units, transactions, ATV, AUR, UPT. group_by options: 'location' (per store), 'brand' (per vendor), 'location_brand' (store+vendor), 'day' (daily totals), 'day_location' (daily per store). Filter by location_code or brand name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from":     {"type": "string", "description": "Start date YYYY-MM-DD"},
+                "date_to":       {"type": "string", "description": "End date YYYY-MM-DD"},
+                "group_by":      {"type": "string", "description": "Aggregation: 'location' (default), 'brand', 'location_brand', 'day', 'day_location'"},
+                "location_code": {"type": "string", "description": "Optional: filter to one store. Codes: 001=260 Fifth, 002=261 5th Ave, 003=148 Lafayette, 004=477 Broome, 005=LA, 006=2151 Broadway, 008=468 Broadway, 009=Chicago, 010=Miami NW 2nd, 011=1517 3rd Ave, 012=Dallas, 013=Miami NW 23rd"},
+                "brand":         {"type": "string", "description": "Optional: filter to one brand/vendor name (partial match)"}
+            },
+            "required": ["date_from", "date_to"]
+        }
     },
     {
         "name": "run_bi_report",
