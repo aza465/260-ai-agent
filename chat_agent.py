@@ -56,6 +56,7 @@ SS_API_KEY         = os.environ.get("SS_API_KEY")
 SS_WORKSPACE_ID    = os.environ.get("SS_WORKSPACE_ID")
 
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+BI_CREDS_PATH      = os.environ.get("BI_BIGQUERY_KEY_FILE", "bigquery-492618-credentials.json")
 CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001"
 CLAUDE_SONNET_MODEL = "claude-sonnet-4-6"
 
@@ -68,6 +69,9 @@ TIER3_SIGNALS = [
     "report", "analyze", "analysis", "summary", "compare", "comparison",
     "breakdown", "trend", "versus", " vs ", "generate", "draft",
     "write a", "create a", "make a", "send a", "post a",
+    "labor", "labour", "staffing", "overstaffed", "understaffed",
+    "labor cost", "labour cost", "payroll", "hours worked", "sales per hour",
+    "bi report", "in-store kpi", "store performance",
 ]
 TIER2_SIGNALS = [
     "vendor", "sales", "orders", "revenue", "shopify", "bigquery",
@@ -100,6 +104,18 @@ tavily      = TavilyClient(api_key=os.environ['TAVILY_API_KEY'])
 bq_client   = bigquery.Client(project="gen-lang-client-0065509773")
 ga4_client  = BetaAnalyticsDataClient()
 GA4_PROPERTY = "properties/329727471"
+
+# BI agent BigQuery client — reads from both chelsea-morning-prod-twc (sales)
+# and bigquery-492618 (Deputy labor). Uses separate service account.
+try:
+    bi_bq_client = bigquery.Client.from_service_account_json(
+        BI_CREDS_PATH,
+        project="bigquery-492618"
+    )
+    logger.info("[BI] Deputy/Teamwork BI BigQuery client initialized")
+except Exception as e:
+    bi_bq_client = None
+    logger.warning(f"[BI] BI BigQuery client unavailable: {e}. run_bi_report will be disabled.")
 
 # --- ChromaDB persistent memory ---
 try:
@@ -137,33 +153,12 @@ def run_bigquery_report(sql_query: str):
 
     AVAILABLE TABLES:
 
-    TABLE 1 — Shopify Vendor Performance:
+    TABLE 1 — Shopify Vendor Performance (currently unpopulated — use query_shopify_analytics instead):
     `gen-lang-client-0065509773.shopify_data.vendor_performance`
-    COLUMNS: account_name (STRING), date (DATE), order_name (STRING),
-             vendor_name (STRING), net_sales (FLOAT), order_count (INTEGER),
-             units_sold (INTEGER), last_updated (TIMESTAMP)
-
-    TABLE 2 — Teamwork POS Transactions:
-    `gen-lang-client-0065509773.pos_data.teamwork_transactions`
-    NOTE: Verify the exact table path in your BigQuery console before using.
-    COLUMNS: transaction_date (DATE), location_name (STRING), sku (STRING),
-             product_name (STRING), category (STRING), quantity (INTEGER),
-             unit_price (FLOAT), net_amount (FLOAT), customer_id (STRING)
+    COLUMNS: account_name, date, order_name, vendor_name, net_sales, order_count, units_sold, last_updated
 
     NOTES: Always add LIMIT clauses. Use DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
     for yesterday's data. Use DATE_TRUNC for week/month grouping.
-
-    SHOPIFY EXAMPLE:
-    SELECT vendor_name, SUM(net_sales) as total_sales, SUM(units_sold) as units
-    FROM `gen-lang-client-0065509773.shopify_data.vendor_performance`
-    WHERE date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AND vendor_name IS NOT NULL
-    GROUP BY vendor_name ORDER BY total_sales DESC LIMIT 20
-
-    POS EXAMPLE:
-    SELECT location_name, SUM(net_amount) as revenue
-    FROM `gen-lang-client-0065509773.pos_data.teamwork_transactions`
-    WHERE transaction_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
-    GROUP BY location_name ORDER BY revenue DESC LIMIT 10
     """
     logger.info("[BIGQUERY] Running query...")
     try:
@@ -171,6 +166,84 @@ def run_bigquery_report(sql_query: str):
         return json.dumps([dict(row) for row in results], default=str)
     except Exception as e:
         return f"BigQuery Error: {str(e)}"
+
+
+def run_bi_report(date_from: str, date_to: str, location_code: str = None):
+    """
+    Runs a combined labor + sales KPI report by joining:
+      - Teamwork Commerce BQ (sales): chelsea-morning-prod-twc.external_datamart_1.all_SalesReceipt
+      - Deputy BQ (labor): bigquery-492618.business_intelligence.timesheets
+
+    Returns per-store KPIs for the date range: Sales, Units, Transactions, ATV, UPT, AUR,
+    Labor Hours, Labor Cost, Labor Cost %, Sales per Labor Hour.
+
+    date_from / date_to: YYYY-MM-DD format
+    location_code: optional — filter to a single store (e.g. '001', '002'). Omit for all stores.
+
+    STORE CODES:
+    001=260 Fifth, 002=261 5th Ave, 003=148 Lafayette St, 004=477 Broome St,
+    005=301 North Canon Dr (LA), 006=2151 Broadway, 008=468 Broadway,
+    009=1457 N Halsted St (Chicago), 010=2450 NW 2nd Ave (Miami),
+    011=1517 3rd Ave, 012=6030 Luther Lane (Texas), 013=173 NW 23rd St (Miami)
+    """
+    if bi_bq_client is None:
+        return "BI BigQuery client not initialized. Check BI_BIGQUERY_KEY_FILE in .env."
+
+    location_filter = f"AND location.LocationCode = '{location_code}'" if location_code else ""
+
+    sql = f"""
+    WITH sales AS (
+      SELECT
+        sale.Date                              AS date,
+        location.LocationCode                  AS location_code,
+        location.LocationName                  AS location_name,
+        SUM(sale.NetSalesAmt)                 AS net_sales,
+        SUM(sale.Qty)                         AS units,
+        COUNT(DISTINCT sale.UniversalNo)      AS transactions
+      FROM `chelsea-morning-prod-twc.external_datamart_1.all_SalesReceipt`
+      WHERE Date_Part BETWEEN '{date_from}' AND '{date_to}'
+        AND sale.IsReturn = false
+        AND sale.RptIgnored = false
+        {location_filter}
+      GROUP BY date, location_code, location_name
+    ),
+    labor AS (
+      SELECT
+        t.date,
+        sm.teamwork_location_code              AS location_code,
+        SUM(t.attributed_total_hours)         AS labor_hours,
+        SUM(t.attributed_total_cost)          AS labor_cost
+      FROM `bigquery-492618.business_intelligence.timesheets` t
+      JOIN `bigquery-492618.business_intelligence.store_mapping` sm
+        ON t.attributed_company_id = sm.deputy_company_id
+      WHERE t.date BETWEEN '{date_from}' AND '{date_to}'
+      GROUP BY t.date, sm.teamwork_location_code
+    )
+    SELECT
+      s.date,
+      s.location_code,
+      s.location_name,
+      ROUND(s.net_sales, 2)                                           AS sales,
+      s.units,
+      s.transactions,
+      ROUND(SAFE_DIVIDE(s.net_sales, s.transactions), 2)             AS atv,
+      ROUND(SAFE_DIVIDE(s.net_sales, s.units), 2)                    AS aur,
+      ROUND(SAFE_DIVIDE(s.units, s.transactions), 2)                 AS upt,
+      ROUND(l.labor_hours, 2)                                         AS labor_hours,
+      ROUND(l.labor_cost, 2)                                          AS labor_cost,
+      ROUND(SAFE_DIVIDE(l.labor_cost, s.net_sales) * 100, 1)        AS labor_cost_pct,
+      ROUND(SAFE_DIVIDE(s.net_sales, l.labor_hours), 2)             AS sales_per_labor_hour
+    FROM sales s
+    LEFT JOIN labor l USING (date, location_code)
+    ORDER BY s.date, s.location_code
+    """
+    logger.info(f"[BI] Running combined labor+sales report {date_from} → {date_to}")
+    try:
+        results = list(bi_bq_client.query(sql).result())
+        return json.dumps([dict(row) for row in results], default=str)
+    except Exception as e:
+        logger.error(f"[BI] Query error: {e}")
+        return f"BI Report Error: {str(e)}"
 
 # --- Platform 2: Shopify Analytics ---
 
@@ -906,6 +979,7 @@ def save_to_memory(fact: str, memory_type: str = "fact", namespace: str = "gener
 TOOL_DISPATCH_MAP = {
     "web_search":               web_search,
     "run_bigquery_report":      run_bigquery_report,
+    "run_bi_report":            run_bi_report,
     "query_shopify_analytics":  query_shopify_analytics,
     "list_basecamp_projects":        list_basecamp_projects,
     "get_project_tools":             get_project_tools,
@@ -945,8 +1019,21 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "run_bigquery_report",
-        "description": "Executes SQL against BigQuery for historical data. NOTE: shopify_data.vendor_performance columns are currently unpopulated — use query_shopify_analytics instead for vendor sales. Table (2) pos_data.teamwork_transactions has columns: location, product_name, vendor, quantity, net_sales, transaction_date. Always use full table path with project: `gen-lang-client-0065509773.dataset.table`. Always use LIMIT clauses.",
+        "description": "Executes SQL against the internal BigQuery project (gen-lang-client-0065509773) for ad-hoc queries. NOTE: shopify_data.vendor_performance is currently unpopulated — use query_shopify_analytics for vendor sales. Always use full table paths and LIMIT clauses.",
         "input_schema": {"type": "object", "properties": {"sql_query": {"type": "string", "description": "Valid BigQuery Standard SQL query string"}}, "required": ["sql_query"]}
+    },
+    {
+        "name": "run_bi_report",
+        "description": "Runs a combined in-store labor + sales KPI report by joining Teamwork Commerce POS data (chelsea-morning-prod-twc) with Deputy labor/payroll data (bigquery-492618). Returns per-store metrics: Sales, Units, Transactions, ATV, AUR, UPT, Labor Hours, Labor Cost, Labor Cost %, Sales per Labor Hour. Use this for any question about labor efficiency, staffing costs, overstaffing, or comparing labor spend to sales performance across physical store locations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Start date in YYYY-MM-DD format"},
+                "date_to":   {"type": "string", "description": "End date in YYYY-MM-DD format"},
+                "location_code": {"type": "string", "description": "Optional: filter to one store by Teamwork location code. Codes: 001=260 Fifth, 002=261 5th Ave, 003=148 Lafayette, 004=477 Broome, 005=301 N Canon (LA), 006=2151 Broadway, 008=468 Broadway, 009=Chicago, 010=Miami NW 2nd, 011=1517 3rd Ave, 012=Texas, 013=Miami NW 23rd"}
+            },
+            "required": ["date_from", "date_to"]
+        }
     },
     {
         "name": "query_shopify_analytics",
@@ -1462,8 +1549,12 @@ Key tables: Tasks, Requests, Inventory, Projects, Brands.
   Always exclude 'ShipInsure' from vendor results — it is a shipping protection add-on, not a brand.
   'Inner Circle' is the 260 loyalty program — exclude from sales/vendor reporting. It does appear in
   Shopify data as line pass and VIP pass purchases which are relevant for event operations context.
-- **BigQuery**: POS and historical data — `pos_data.teamwork_transactions` (in-store POS by location/product/date).
-  Note: shopify_data.vendor_performance columns are currently unpopulated — use ShopifyQL for vendor sales.
+- **BI Report (run_bi_report)**: Combined in-store labor + sales KPI tool. Joins Teamwork Commerce POS
+  (chelsea-morning-prod-twc — 11.7M rows back to 2017, updated daily) with Deputy labor/payroll data.
+  Use for: labor cost %, sales per labor hour, staffing efficiency, store performance benchmarks.
+  Requires date_from and date_to (YYYY-MM-DD). Optionally filter by location_code.
+- **BigQuery (run_bigquery_report)**: Ad-hoc queries against internal project (gen-lang-client-0065509773).
+  Note: shopify_data.vendor_performance is currently unpopulated — use ShopifyQL for vendor sales.
 - **Google Analytics 4** (Property: 329727471): Web traffic, traffic sources, top pages, conversions,
   and revenue. Use to understand digital demand signals before and during events.
 - **Web Search**: Brand research, market context, anything not in internal systems.
