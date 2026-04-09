@@ -1,5 +1,7 @@
 .env
 credentials.json
+*.json
+!.env.example
 venv/
 __pycache__/
 *.pyc
