@@ -1125,7 +1125,11 @@ def cleanup_sessions():
 # ============================================================
 
 def _restore_session_from_chromadb(space_name: str) -> list:
-    """Retrieves recent conversation history for a space from ChromaDB (internal use)."""
+    """
+    Retrieves recent conversation history for a space from ChromaDB.
+    If the last exchange was more than 24 hours ago, starts fresh to prevent
+    the model from anchoring to stale dates or outdated context.
+    """
     if not CHROMA_ENABLED or conversations_col.count() == 0:
         return []
     try:
@@ -1139,6 +1143,14 @@ def _restore_session_from_chromadb(space_name: str) -> list:
             zip(results["documents"], results["metadatas"]),
             key=lambda x: x[1].get("timestamp", 0)
         )[-10:]  # last 10 exchanges
+
+        # If the most recent exchange is older than 24 hours, start fresh
+        last_timestamp = pairs[-1][1].get("timestamp", 0)
+        age_hours = (time.time() - last_timestamp) / 3600
+        if age_hours > 24:
+            logger.info(f"[SESSION] Last exchange was {age_hours:.0f}h ago — starting fresh session")
+            return []
+
         messages = []
         for doc, _ in pairs:
             parts = doc.split("\nAssistant: ", 1)
