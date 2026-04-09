@@ -28,17 +28,24 @@ Interface: Google Chat (via Pub/Sub) → Python 3.11 on GCP (e2-standard-2).
 |---|---|---|
 | Google Chat + Pub/Sub | Topic: `chat-agent-topic`, Sub: `chat-agent-sub` | `credentials.json` (service account) |
 | Shopify (ShopifyQL) | **Primary source for vendor sales** | `SHOPIFY_TOKEN` in `.env` |
-| BigQuery | POS only (`pos_data.teamwork_transactions`) — see note below | `credentials.json` |
+| BigQuery (internal) | Ad-hoc queries — `gen-lang-client-0065509773` | `credentials.json` |
+| BigQuery (BI) | Teamwork Commerce POS + Deputy labor — `run_bi_report()` | `bigquery-492618-*.json` (BI_BIGQUERY_KEY_FILE) |
 | Google Analytics 4 | Traffic, engagement, conversions | `credentials.json`, Property `329727471` |
 | Basecamp | 15 active projects, read/write | OAuth — `BC_LIVE_ACCESS_TOKEN` in `.env` |
 | SmartSuite | Tasks, Requests, Inventory, Projects, Brands tables | `SS_API_KEY` in `.env` |
 | Tavily | Web search | `TAVILY_API_KEY` in `.env` |
 | Anthropic | Claude Haiku + Sonnet | `ANTHROPIC_API_KEY` in `.env` |
 
-## BigQuery — Important Note
-`shopify_data.vendor_performance` exists but all data columns (`vendor_name`, `net_sales`, etc.)
-are NULL — the pipeline that populates it has never run. **Do not route vendor sales queries here.**
-Use ShopifyQL instead. Only `pos_data.teamwork_transactions` has real data.
+## BigQuery — Two Clients
+
+**Internal BQ** (`gen-lang-client-0065509773`, `credentials.json`):
+- `shopify_data.vendor_performance` — all data columns NULL, pipeline never ran. Use ShopifyQL instead.
+
+**BI BQ** (`bigquery-492618`, `BI_BIGQUERY_KEY_FILE`):
+- `chelsea-morning-prod-twc.external_datamart_1.all_SalesReceipt` — Teamwork Commerce POS (real data)
+- `bigquery-492618.business_intelligence.timesheets` — Deputy labor/payroll data
+- `bigquery-492618.business_intelligence.store_mapping` — maps Deputy company IDs to Teamwork location codes
+- Use `run_bi_report(date_from, date_to)` for combined labor + sales KPIs — do not query these tables directly
 
 ## ShopifyQL — Correct Syntax
 ```
