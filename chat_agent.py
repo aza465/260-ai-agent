@@ -1208,6 +1208,16 @@ def dispatch_tool(name: str, kwargs: dict) -> str:
 # SECTION 9: AGENTIC LOOPS
 # ============================================================
 
+# Load business context from BUSINESS_CONTEXT.md at startup
+_bc_context_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BUSINESS_CONTEXT.md")
+try:
+    with open(_bc_context_path, "r") as f:
+        BUSINESS_CONTEXT = f.read()
+    logger.info("[CONTEXT] BUSINESS_CONTEXT.md loaded")
+except FileNotFoundError:
+    BUSINESS_CONTEXT = ""
+    logger.warning("[CONTEXT] BUSINESS_CONTEXT.md not found — running without business context")
+
 SYSTEM_PROMPT_BASE = """# ROLE: 260 Sample Sale — Lead Business Analyst & Ops Coordinator
 
 You are the "Chief of Staff" for 260 Sample Sale — a high-volume luxury sample sale retailer
@@ -1280,7 +1290,8 @@ Key tables: Tasks, Requests, Inventory, Projects, Brands.
 - **Confidentiality**: Never reference Brand A's performance data when discussing Brand B.
 
 Today: {today}. Timezone: America/New_York.
-{memory_context}"""
+{memory_context}
+{business_context}"""
 
 def _run_claude_loop(messages: list, system_prompt: str, model: str, max_tokens: int) -> str:
     """Core Claude agentic tool-use loop — shared by both Haiku and Sonnet."""
@@ -1325,7 +1336,11 @@ def process_ai_response(user_text: str, space_name: str) -> str:
     """Routes the user message to the appropriate model and returns the final reply."""
     session = get_or_create_session(space_name)
     memory_ctx = build_memory_context(user_text)
-    system_prompt = SYSTEM_PROMPT_BASE.format(today=datetime.now().strftime("%Y-%m-%d"), memory_context=memory_ctx)
+    system_prompt = SYSTEM_PROMPT_BASE.format(
+        today=datetime.now().strftime("%Y-%m-%d"),
+        memory_context=memory_ctx,
+        business_context=BUSINESS_CONTEXT
+    )
 
     with sessions_lock:
         messages = list(session["messages"]) + [{"role": "user", "content": user_text}]
