@@ -778,6 +778,60 @@ def update_smartsuite_record(table_id: str, record_id: str, data_dict: dict):
     except Exception as e:
         return f"SmartSuite Error: {str(e)}"
 
+def search_event_history(brand_name: str, limit: int = 10):
+    """
+    Searches the 260 Sample Sale Events table in SmartSuite for all past events matching a brand name.
+    Returns a list of events with: title, start_date, end_date, status, location (parsed from title).
+
+    Use this BEFORE running a Shopify comparison query so you know the exact date ranges
+    for a brand's previous events. Then call query_shopify_analytics() with those dates.
+
+    WORKFLOW for "compare this sale vs last time":
+    1. search_event_history("Brand Name") → get previous event dates
+    2. query_shopify_analytics() for current event date range
+    3. query_shopify_analytics() for previous event date range
+    4. Compare results
+
+    EXAMPLE: search_event_history("Reformation") returns all Reformation events with dates.
+    """
+    logger.info(f"[EVENTS] Searching event history for: {brand_name}")
+    url = "https://app.smartsuite.com/api/v1/applications/66701d05a001f383eebc5b74/records/list/"
+    headers = {"Authorization": f"Token {SS_API_KEY}", "Account-Id": SS_WORKSPACE_ID, "Content-Type": "application/json"}
+    payload = {
+        "filter": {
+            "operator": "and",
+            "fields": [{"field": "title", "comparison": "contains", "value": brand_name}]
+        },
+        "sort": [{"field": "s50655b853", "direction": "desc"}]
+    }
+    try:
+        r = requests.post(url, json=payload, headers=headers)
+        if r.status_code != 200:
+            return f"Error: {r.status_code}"
+        events = []
+        for rec in r.json().get("items", [])[:limit]:
+            title  = rec.get("title", "")
+            status = rec.get("sc801fb2b6", {}).get("value") or rec.get("status", {}).get("value", "")
+            date_range = rec.get("s50655b853", {})
+            start = (date_range.get("from_date") or {}).get("date", "")[:10] if date_range else ""
+            end   = (date_range.get("to_date")   or {}).get("date", "")[:10] if date_range else ""
+            # Parse location from title (everything after last comma)
+            parts = title.split(", ")
+            location = parts[-1] if len(parts) > 2 else ""
+            events.append({
+                "title":      title,
+                "brand":      parts[0] if parts else brand_name,
+                "start_date": start,
+                "end_date":   end,
+                "location":   location,
+                "status":     status,
+            })
+        logger.info(f"[EVENTS] Found {len(events)} events for '{brand_name}'")
+        return json.dumps(events)
+    except Exception as e:
+        logger.error(f"[EVENTS] Error: {e}")
+        return f"SmartSuite Error: {str(e)}"
+
 def get_staff_directory(department: str = None, active_only: bool = True):
     """
     Returns the 260 Sample Sale internal team directory from SmartSuite.
@@ -870,6 +924,7 @@ TOOL_DISPATCH_MAP = {
     "ga4_top_pages":            ga4_top_pages,
     "ga4_conversions":          ga4_conversions,
     "ga4_custom_report":        ga4_custom_report,
+    "search_event_history":      search_event_history,
     "get_staff_directory":       get_staff_directory,
     "list_smartsuite_tables":   list_smartsuite_tables,
     "read_smartsuite_records":  read_smartsuite_records,
@@ -1089,6 +1144,18 @@ TOOLS_SCHEMA = [
                 "limit": {"type": "integer", "description": "Max rows. Default: 20"}
             },
             "required": ["dimensions", "metrics"]
+        }
+    },
+    {
+        "name": "search_event_history",
+        "description": "Searches the SmartSuite Events table for all past 260 Sample Sale events matching a brand name. Returns title, start_date, end_date, location, and status for each event. ALWAYS call this first when asked to compare a current sale vs a previous one — it gives you the exact date ranges to use in query_shopify_analytics().",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brand_name": {"type": "string", "description": "Brand or vendor name to search for — e.g. 'Reformation', 'Theory', 'Rag & Bone'"},
+                "limit": {"type": "integer", "description": "Max events to return, sorted most recent first. Default: 10"}
+            },
+            "required": ["brand_name"]
         }
     },
     {
