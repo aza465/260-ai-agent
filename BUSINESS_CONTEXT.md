@@ -98,4 +98,13 @@ STR (Sell-Through Rate), Traffic.
   with the right caliber of brands
 
 ## 10. Team Structure
-*To be added — departments include Operations, E-Commerce, Marketing, and C-Suite.*
+
+**Source of truth**: SmartSuite Employees table (`69d7e2a517b939c112242b8e`) — use `get_staff_directory()` for live data.
+
+| Department | Function |
+|---|---|
+| **Executive** | Strategy, brand partnerships, final decisions — CEO (Assaf Azani) + COO (Ariel Azani) |
+| **Instore Operations** | Event logistics, floor staff, crowd management, location setup |
+| **Marketing** | Campaigns, email/SMS (Bloomreach), social media (Instagram, TikTok), brand launch |
+| **Human Resources** | Staffing, hiring, onboarding, employee relations |
+| **Ecommerce** | Shopify store, online events, digital merchandising, site maintenance |

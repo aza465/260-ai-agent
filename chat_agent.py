@@ -1,11 +1,12 @@
 import os
+import re
 import json
 import time
 import uuid
 import threading
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -62,11 +63,22 @@ SESSION_TTL_SECONDS  = 3600   # sessions expire after 1 hour of inactivity
 SESSION_MAX_MESSAGES = 40     # trim history to prevent context overflow
 MAX_TOOL_ROUNDS      = 10     # max tool call iterations per response
 
-# Queries containing these words are routed to Claude (more powerful)
-COMPLEX_SIGNALS = [
-    "report", "compare", "analyze", "summary", "post to", "post a",
-    "generate", "schedule", "breakdown", "trend", "vs", "versus",
-    "create a", "make a", "write a", "send a", "draft"
+# Complexity tier signals for classify_complexity()
+TIER3_SIGNALS = [
+    "report", "analyze", "analysis", "summary", "compare", "comparison",
+    "breakdown", "trend", "versus", " vs ", "generate", "draft",
+    "write a", "create a", "make a", "send a", "post a",
+]
+TIER2_SIGNALS = [
+    "vendor", "sales", "orders", "revenue", "shopify", "bigquery",
+    "basecamp", "smartsuite", "ga4", "analytics", "traffic", "inventory",
+    "brand", "todo", "task", "request", "project", "search",
+    "show me", "what are", "how many", "list", "check", "look up",
+]
+CONVERSATIONAL_SIGNALS = [
+    "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+    "thanks", "thank you", "bye", "goodbye", "great", "sounds good",
+    "ok", "okay", "got it", "perfect", "awesome",
 ]
 
 # ============================================================
@@ -471,14 +483,14 @@ def sync_basecamp_projects_to_memory():
                 )
                 knowledge_col.upsert(
                     documents=[fact],
-                    metadatas=[{"type": "basecamp_project", "project_id": str(pid), "date": datetime.now().strftime("%Y-%m-%d"), "timestamp": time.time()}],
+                    metadatas=[{"type": "basecamp_project", "namespace": "basecamp", "project_id": str(pid), "date": datetime.now().strftime("%Y-%m-%d"), "timestamp": time.time()}],
                     ids=[f"bc_project_{pid}"]
                 )
         # Save sync timestamp
         if CHROMA_ENABLED:
             knowledge_col.upsert(
                 documents=["Basecamp project sync timestamp"],
-                metadatas=[{"type": "bc_sync_meta", "timestamp": time.time(), "date": datetime.now().strftime("%Y-%m-%d")}],
+                metadatas=[{"type": "bc_sync_meta", "namespace": "basecamp", "timestamp": time.time(), "date": datetime.now().strftime("%Y-%m-%d")}],
                 ids=["bc_sync_timestamp"]
             )
         logger.info(f"[BASECAMP] Synced {len(synced)} projects to memory")
@@ -766,16 +778,57 @@ def update_smartsuite_record(table_id: str, record_id: str, data_dict: dict):
     except Exception as e:
         return f"SmartSuite Error: {str(e)}"
 
+def get_staff_directory(department: str = None, active_only: bool = True):
+    """
+    Returns the 260 Sample Sale internal team directory from SmartSuite.
+    Each entry includes: name, email, job_title, employment_status.
+
+    department: optional filter — e.g. "Executive", "Marketing", "Ecommerce",
+                "Instore Operations", "Human Resources". Case-insensitive substring match on job_title.
+    active_only: if True (default), only returns employees with employment_status = "Active".
+
+    Use this to:
+    - Find who to contact or route a question to
+    - Look up an employee's email before suggesting someone follow up
+    - Answer "who handles X?" questions
+
+    NOTE: Google Chat @mentions require user IDs not available here.
+    Reference people by name and email instead.
+    """
+    logger.info(f"[STAFF] Fetching staff directory (dept={department}, active_only={active_only})")
+    url = "https://app.smartsuite.com/api/v1/applications/69d7e2a517b939c112242b8e/records/list/"
+    headers = {"Authorization": f"Token {SS_API_KEY}", "Account-Id": SS_WORKSPACE_ID, "Content-Type": "application/json"}
+    try:
+        r = requests.post(url, json={}, headers=headers)
+        if r.status_code != 200:
+            return f"Error: {r.status_code}"
+        staff = []
+        for rec in r.json().get("items", []):
+            status = rec.get("employment_status", {}).get("value", "")
+            if active_only and status != "Active":
+                continue
+            name      = rec.get("title", "")
+            email     = rec.get("email", [None])[0] if rec.get("email") else ""
+            job_title = rec.get("job_title", "")
+            entry = {"name": name, "email": email, "job_title": job_title, "status": status or "Unknown"}
+            if department and department.lower() not in job_title.lower():
+                continue
+            staff.append(entry)
+        return json.dumps(staff)
+    except Exception as e:
+        return f"SmartSuite Error: {str(e)}"
+
 # --- Platform 5: Long-Term Memory ---
 
-def save_to_memory(fact: str, memory_type: str = "fact"):
+def save_to_memory(fact: str, memory_type: str = "fact", namespace: str = "general"):
     """
     Saves an important business fact, user preference, or report summary to long-term memory.
     Call this proactively when the user states a preference, important context, or key business fact.
     memory_type options: "fact", "preference", "report"
+    namespace options: "shopify", "basecamp", "smartsuite", "general"
 
-    EXAMPLE: save_to_memory("User prefers vendors sorted by net_sales descending", "preference")
-    EXAMPLE: save_to_memory("Top vendor for Feb 2026 was Brand X with $45,000 net sales", "fact")
+    EXAMPLE: save_to_memory("User prefers vendors sorted by net_sales descending", "preference", "shopify")
+    EXAMPLE: save_to_memory("Top vendor for Feb 2026 was Brand X with $45,000 net sales", "fact", "shopify")
     """
     if not CHROMA_ENABLED:
         return "Memory storage unavailable."
@@ -783,7 +836,7 @@ def save_to_memory(fact: str, memory_type: str = "fact"):
         doc_id = f"{memory_type}_{uuid.uuid4().hex[:8]}_{int(time.time())}"
         knowledge_col.add(
             documents=[fact],
-            metadatas=[{"type": memory_type, "date": datetime.now().strftime("%Y-%m-%d"), "timestamp": time.time()}],
+            metadatas=[{"type": memory_type, "namespace": namespace, "date": datetime.now().strftime("%Y-%m-%d"), "timestamp": time.time()}],
             ids=[doc_id]
         )
         logger.info(f"[MEMORY] Saved {memory_type}: {fact[:80]}")
@@ -817,6 +870,7 @@ TOOL_DISPATCH_MAP = {
     "ga4_top_pages":            ga4_top_pages,
     "ga4_conversions":          ga4_conversions,
     "ga4_custom_report":        ga4_custom_report,
+    "get_staff_directory":       get_staff_directory,
     "list_smartsuite_tables":   list_smartsuite_tables,
     "read_smartsuite_records":  read_smartsuite_records,
     "create_smartsuite_record": create_smartsuite_record,
@@ -1038,6 +1092,17 @@ TOOLS_SCHEMA = [
         }
     },
     {
+        "name": "get_staff_directory",
+        "description": "Returns the 260 Sample Sale internal team directory from SmartSuite. Each entry has name, email, job_title, and employment_status. Use to find who handles a topic, look up contact info, or route a question to the right person. Departments: Executive, Instore Operations, Marketing, Human Resources, Ecommerce.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "department": {"type": "string", "description": "Optional keyword to filter by department or role — e.g. 'Marketing', 'COO', 'Ecommerce'. Case-insensitive match against job_title."},
+                "active_only": {"type": "boolean", "description": "If true (default), returns only Active employees."}
+            }
+        }
+    },
+    {
         "name": "list_smartsuite_tables",
         "description": "Lists all SmartSuite tables (applications) with their IDs. Key tables: To Do, Tasks, Requests, Projects, Brands, Inventory.",
         "input_schema": {"type": "object", "properties": {}}
@@ -1087,7 +1152,8 @@ TOOLS_SCHEMA = [
             "type": "object",
             "properties": {
                 "fact": {"type": "string", "description": "The fact or preference to remember"},
-                "memory_type": {"type": "string", "description": "'fact', 'preference', or 'report'", "enum": ["fact", "preference", "report"]}
+                "memory_type": {"type": "string", "description": "'fact', 'preference', or 'report'", "enum": ["fact", "preference", "report"]},
+                "namespace": {"type": "string", "description": "Domain namespace for structured retrieval: 'shopify' (sales/vendor data), 'basecamp' (project/event data), 'smartsuite' (brand/CRM data), 'general' (cross-domain facts)", "enum": ["shopify", "basecamp", "smartsuite", "general"]}
             },
             "required": ["fact"]
         }
@@ -1162,13 +1228,41 @@ def _restore_session_from_chromadb(space_name: str) -> list:
         logger.warning(f"[MEMORY] Session restore error: {e}")
         return []
 
+def _detect_namespace(user_text: str) -> str | None:
+    """Infers a ChromaDB namespace from the query domain, or None if unclear."""
+    text = user_text.lower()
+    if any(kw in text for kw in ["vendor", "sales", "order", "shopify", "product", "revenue", "gross"]):
+        return "shopify"
+    if any(kw in text for kw in ["basecamp", "campfire", "briefing", "message board", "event project"]):
+        return "basecamp"
+    if any(kw in text for kw in ["smartsuite", "brand profile", "crm", "brand record", "inventory record"]):
+        return "smartsuite"
+    return None
+
 def build_memory_context(user_text: str) -> str:
-    """Retrieves relevant knowledge/facts from ChromaDB to inject into the system prompt."""
+    """
+    Retrieves relevant knowledge/facts from ChromaDB to inject into the system prompt.
+    When the query clearly maps to a domain, filters by namespace first.
+    Falls back to unfiltered search if no results are found.
+    """
     if not CHROMA_ENABLED or knowledge_col.count() == 0:
         return ""
     try:
-        results = knowledge_col.query(query_texts=[user_text], n_results=5)
-        docs = results["documents"][0] if results["documents"] else []
+        docs = []
+        namespace = _detect_namespace(user_text)
+        if namespace:
+            try:
+                results = knowledge_col.query(
+                    query_texts=[user_text],
+                    n_results=5,
+                    where={"namespace": {"$eq": namespace}}
+                )
+                docs = results["documents"][0] if results["documents"] else []
+            except Exception:
+                pass  # fall through to unfiltered search
+        if not docs:
+            results = knowledge_col.query(query_texts=[user_text], n_results=5)
+            docs = results["documents"][0] if results["documents"] else []
         if not docs:
             return ""
         facts = "\n".join(f"- {doc}" for doc in docs)
@@ -1185,7 +1279,7 @@ def save_conversation_turn(space_name: str, user_text: str, ai_response: str):
         doc_id = f"conv_{space_name.replace('/', '_')}_{int(time.time())}"
         conversations_col.add(
             documents=[f"User: {user_text}\nAssistant: {ai_response}"],
-            metadatas=[{"space_name": space_name, "timestamp": time.time(), "date": datetime.now().strftime("%Y-%m-%d")}],
+            metadatas=[{"space_name": space_name, "namespace": "general", "timestamp": time.time(), "date": datetime.now().strftime("%Y-%m-%d")}],
             ids=[doc_id]
         )
     except Exception as e:
@@ -1195,14 +1289,40 @@ def save_conversation_turn(space_name: str, user_text: str, ai_response: str):
 # SECTION 8: ROUTING + DISPATCH
 # ============================================================
 
-def route_query(user_text: str) -> str:
-    """Routes query to 'local' (Ollama) or 'claude' based on complexity signals."""
-    text = user_text.lower()
-    if any(signal in text for signal in COMPLEX_SIGNALS):
-        return "claude"
-    if len(user_text.split()) > 20:
-        return "claude"
-    return "local"
+def classify_complexity(message: str) -> int:
+    """
+    Returns routing tier: 1 (simple/conversational), 2 (moderate/single-tool),
+    or 3 (complex/multi-source/reports).
+    Tier 1 → Haiku (1k tokens). Tier 2 → Sonnet (2k tokens). Tier 3 → Sonnet (4k tokens).
+    """
+    text = message.lower()
+    word_count = len(message.split())
+
+    # Count distinct platforms referenced
+    platforms_mentioned = sum([
+        any(kw in text for kw in ["shopify", "vendor", "sales", "order"]),
+        any(kw in text for kw in ["bigquery", "bq", "pos", "in-store", "in store"]),
+        any(kw in text for kw in ["basecamp", "campfire", "message board"]),
+        any(kw in text for kw in ["smartsuite", "brand profile", "inventory"]),
+        any(kw in text for kw in ["ga4", "analytics", "traffic", "sessions"]),
+    ])
+
+    # Tier 3: reports, analysis, multi-source, or long messages
+    if any(signal in text for signal in TIER3_SIGNALS):
+        return 3
+    if platforms_mentioned >= 2:
+        return 3
+    if word_count > 30:
+        return 3
+
+    # Tier 1: short conversational messages with no data signals
+    if word_count < 10 and not any(signal in text for signal in TIER2_SIGNALS):
+        return 1
+    if any(signal in text for signal in CONVERSATIONAL_SIGNALS) and word_count < 15:
+        return 1
+
+    # Tier 2: single-tool queries and everything else
+    return 2
 
 def dispatch_tool(name: str, kwargs: dict) -> str:
     """Executes a tool by name and returns its result as a string."""
@@ -1230,9 +1350,9 @@ except FileNotFoundError:
     BUSINESS_CONTEXT = ""
     logger.warning("[CONTEXT] BUSINESS_CONTEXT.md not found — running without business context")
 
-SYSTEM_PROMPT_BASE = """# ROLE: 260 Sample Sale — Lead Business Analyst & Ops Coordinator
+SYSTEM_PROMPT_BASE = """# ROLE: Mole — 260 Sample Sale Lead Business Analyst & Ops Coordinator
 
-You are the "Chief of Staff" for 260 Sample Sale — a high-volume luxury sample sale retailer
+Your name is Mole. You are the "Chief of Staff" for 260 Sample Sale — a high-volume luxury sample sale retailer
 with physical locations and an online Shopify store (260-sample-sale.myshopify.com).
 Your goal is to optimize every 7-day event window for our brand partners and internal teams.
 You are not a data clerk. You interpret, synthesize, and recommend.
@@ -1288,6 +1408,17 @@ Key tables: Tasks, Requests, Inventory, Projects, Brands.
   BigQuery data for the same brand or same time period.
 - **Automation Suggestions**: When you spot a recurring manual task in Basecamp or SmartSuite,
   suggest a template, script, or automation to streamline it.
+
+## TEAM & DEPARTMENT ROUTING
+260 has five internal departments. When a question involves a specific function, route it to the right team:
+- **Executive** — Assaf Azani (CEO), Ariel Azani (COO) — strategy, partnerships, final decisions
+- **Instore Operations** — event logistics, floor staff, crowd management, location issues
+- **Marketing** — campaigns, email/SMS (Bloomreach), social media, brand launch promotion
+- **Human Resources** — staffing, hiring, onboarding, employee questions
+- **Ecommerce** — Shopify store, online events, digital merchandising
+
+Use get_staff_directory() to look up current team members, emails, and roles before routing.
+Reference people by name and email — Google Chat @mentions are not currently supported via the API.
 
 ## MEMORY
 - Call save_to_memory() whenever a brand fact, user preference, or key business context is shared.
@@ -1357,29 +1488,35 @@ def process_ai_response(user_text: str, space_name: str) -> str:
     with sessions_lock:
         messages = list(session["messages"]) + [{"role": "user", "content": user_text}]
 
-    # Route: Haiku for simple queries, Sonnet for complex ones
-    use_haiku = route_query(user_text) == "local"
-    model_name = "HAIKU" if use_haiku else "SONNET"
-    logger.info(f"[ROUTER] → {model_name}: {user_text[:80]}")
+    # Route by complexity tier
+    tier = classify_complexity(user_text)
+    _tier_model  = {1: CLAUDE_HAIKU_MODEL,  2: CLAUDE_SONNET_MODEL, 3: CLAUDE_SONNET_MODEL}
+    _tier_tokens = {1: 1024,                2: 2048,                3: 4096}
+    _tier_label  = {1: "HAIKU (Tier 1)",    2: "SONNET (Tier 2)",   3: "SONNET (Tier 3)"}
+    model      = _tier_model[tier]
+    max_tokens = _tier_tokens[tier]
+    logger.info(f"[ROUTER] → {_tier_label[tier]}: {user_text[:80]}")
 
     final_text = None
     for attempt in range(3):
         try:
-            if use_haiku:
-                final_text = run_haiku_loop(list(messages), system_prompt)
-            else:
-                final_text = run_claude_loop(list(messages), system_prompt)
+            final_text = _run_claude_loop(list(messages), system_prompt, model, max_tokens)
             break
         except anthropic.RateLimitError:
             wait = (attempt + 1) * 20
             logger.warning(f"[CLAUDE] Rate limit, waiting {wait}s (attempt {attempt + 1}/3)...")
             time.sleep(wait)
         except Exception as e:
-            logger.error(f"[{model_name}] Error: {e}")
-            if use_haiku:
-                logger.info("[ROUTER] Haiku failed — falling back to Sonnet")
-                use_haiku = False
-                model_name = "SONNET (fallback)"
+            logger.error(f"[{_tier_label[tier]}] Error: {e}")
+            if tier == 1:
+                logger.info("[ROUTER] Tier 1 (Haiku) failed — escalating to Tier 2 (Sonnet)")
+                tier = 2
+                model      = CLAUDE_SONNET_MODEL
+                max_tokens = 2048
+            elif tier == 2:
+                logger.info("[ROUTER] Tier 2 (Sonnet) failed — escalating to Tier 3 (Sonnet high-cap)")
+                tier = 3
+                max_tokens = 4096
             else:
                 return "I encountered an error processing your request. Please try again."
 
@@ -1397,7 +1534,166 @@ def process_ai_response(user_text: str, space_name: str) -> str:
     return final_text
 
 # ============================================================
-# SECTION 11: SCHEDULER (session cleanup only)
+# SECTION 10.5: DAILY REPORT PIPELINE
+# ============================================================
+# Runs at 8 AM ET via APScheduler. Four named stages with verification.
+# Basecamp posting is intentionally deferred — validate data output first.
+# To enable posting: wire log_report_output() to post_to_basecamp() once
+# Stage 1–3 are confirmed working in production.
+
+def fetch_shopify_data() -> dict:
+    """
+    Stage 1: Fetch yesterday's vendor sales from Shopify.
+    Returns {"vendors": [...], "date": "YYYY-MM-DD"} or {"error": "..."}.
+    Verification: vendors list must be non-empty.
+    """
+    logger.info("[PIPELINE] Stage 1 — fetch_shopify_data() starting")
+    yesterday = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    shopify_ql = (
+        f"FROM sales SHOW net_sales, gross_sales, orders "
+        f"GROUP BY product_vendor "
+        f"SINCE {yesterday} UNTIL {yesterday} "
+        f"WITH TIMEZONE 'America/New_York'"
+    )
+    try:
+        raw = query_shopify_analytics(shopify_ql)
+        if raw.startswith("Error") or raw.startswith("Connection") or raw.startswith("ShopifyQL"):
+            logger.error(f"[PIPELINE] Stage 1 FAILED — Shopify error: {raw}")
+            return {"error": raw}
+        data = json.loads(raw)
+        rows = data.get("tableData", {}).get("rows", [])
+        vendors = [
+            r for r in rows
+            if r.get("product_vendor") not in ("ShipInsure", "Inner Circle")
+        ]
+        logger.info(f"[PIPELINE] Stage 1 COMPLETE — {len(vendors)} vendors fetched for {yesterday}")
+        return {"vendors": vendors, "date": yesterday}
+    except Exception as e:
+        logger.error(f"[PIPELINE] Stage 1 FAILED — exception: {e}")
+        return {"error": str(e)}
+
+def fetch_bigquery_data() -> dict:
+    """
+    Stage 2: Fetch yesterday's POS transactions from BigQuery.
+    Returns {"rows": [...], "date": "YYYY-MM-DD"} or {"error": "..."}.
+    Verification: rows list must be non-empty.
+    """
+    logger.info("[PIPELINE] Stage 2 — fetch_bigquery_data() starting")
+    yesterday = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    sql = (
+        f"SELECT location_name, vendor, product_name, quantity, net_amount "
+        f"FROM `gen-lang-client-0065509773.pos_data.teamwork_transactions` "
+        f"WHERE DATE(transaction_date) = '{yesterday}' "
+        f"ORDER BY net_amount DESC "
+        f"LIMIT 500"
+    )
+    try:
+        raw = run_bigquery_report(sql)
+        if raw.startswith("BigQuery Error"):
+            logger.error(f"[PIPELINE] Stage 2 FAILED — BigQuery error: {raw}")
+            return {"error": raw}
+        rows = json.loads(raw)
+        logger.info(f"[PIPELINE] Stage 2 COMPLETE — {len(rows)} POS rows fetched for {yesterday}")
+        return {"rows": rows, "date": yesterday}
+    except Exception as e:
+        logger.error(f"[PIPELINE] Stage 2 FAILED — exception: {e}")
+        return {"error": str(e)}
+
+def merge_and_format_report(shopify_result: dict, bq_result: dict) -> str:
+    """
+    Stage 3: Merges Shopify vendor data and BigQuery POS data into a formatted report string.
+    Verification: output length must be > 100 chars.
+    """
+    logger.info("[PIPELINE] Stage 3 — merge_and_format_report() starting")
+    date = shopify_result.get("date", bq_result.get("date", "unknown"))
+    lines = [f"=== 260 Sample Sale — Daily Report ({date}) ===", ""]
+
+    # Online sales (Shopify)
+    lines.append("--- ONLINE SALES (Shopify) ---")
+    vendors = shopify_result.get("vendors", [])
+    if vendors:
+        lines.append(f"{'Vendor':<35} {'Net Sales':>12} {'Gross Sales':>12} {'Orders':>8}")
+        lines.append("-" * 70)
+        for v in vendors:
+            name  = str(v.get("product_vendor", "Unknown"))[:34]
+            net   = str(v.get("net_sales",   "—"))
+            gross = str(v.get("gross_sales", "—"))
+            orders = str(v.get("orders",     "—"))
+            lines.append(f"{name:<35} {net:>12} {gross:>12} {orders:>8}")
+    else:
+        lines.append("  No online sales data available.")
+    lines.append("")
+
+    # In-store sales (BigQuery POS) — aggregate by location
+    lines.append("--- IN-STORE SALES (POS / BigQuery) ---")
+    rows = bq_result.get("rows", [])
+    if rows:
+        by_location: dict[str, float] = {}
+        for row in rows:
+            loc = row.get("location_name", "Unknown")
+            amt = float(row.get("net_amount", 0) or 0)
+            by_location[loc] = by_location.get(loc, 0.0) + amt
+        for loc, total in sorted(by_location.items(), key=lambda x: -x[1]):
+            lines.append(f"  {loc}: ${total:,.2f}")
+    else:
+        lines.append("  No in-store POS data available.")
+    lines.append("")
+    lines.append("=== END REPORT ===")
+
+    report = "\n".join(lines)
+    logger.info(f"[PIPELINE] Stage 3 COMPLETE — report is {len(report)} chars")
+    return report
+
+def log_report_output(report: str):
+    """
+    Stage 4: Writes the formatted report to the console log.
+    Basecamp posting is deferred — wire post_to_basecamp() here once Stage 1–3 are validated.
+    """
+    logger.info("[PIPELINE] Stage 4 — log_report_output() starting")
+    logger.info(f"[DAILY REPORT]\n{report}")
+    logger.info("[PIPELINE] Stage 4 COMPLETE — report written to log")
+
+def run_daily_report_pipeline():
+    """
+    Orchestrates the 4-stage daily report pipeline. Scheduled at 8 AM ET.
+    Logs stage start, completion, and verification result for each stage.
+    Halts with a logged error if any stage fails verification.
+    """
+    logger.info("[PIPELINE] === Daily report pipeline starting ===")
+
+    # Stage 1
+    shopify_result = fetch_shopify_data()
+    if "error" in shopify_result:
+        logger.error(f"[PIPELINE] HALTED at Stage 1 — fetch error: {shopify_result['error']}")
+        return
+    if not shopify_result.get("vendors"):
+        logger.error("[PIPELINE] HALTED at Stage 1 — verification failed: vendor list is empty")
+        return
+    logger.info(f"[PIPELINE] Stage 1 verified ✓ ({len(shopify_result['vendors'])} vendors)")
+
+    # Stage 2
+    bq_result = fetch_bigquery_data()
+    if "error" in bq_result:
+        logger.error(f"[PIPELINE] HALTED at Stage 2 — fetch error: {bq_result['error']}")
+        return
+    if not bq_result.get("rows"):
+        logger.error("[PIPELINE] HALTED at Stage 2 — verification failed: transaction rows are empty")
+        return
+    logger.info(f"[PIPELINE] Stage 2 verified ✓ ({len(bq_result['rows'])} rows)")
+
+    # Stage 3
+    report = merge_and_format_report(shopify_result, bq_result)
+    if len(report) <= 100:
+        logger.error(f"[PIPELINE] HALTED at Stage 3 — verification failed: report too short ({len(report)} chars)")
+        return
+    logger.info(f"[PIPELINE] Stage 3 verified ✓ ({len(report)} chars)")
+
+    # Stage 4
+    log_report_output(report)
+    logger.info("[PIPELINE] === Daily report pipeline complete ===")
+
+# ============================================================
+# SECTION 11: SCHEDULER (session cleanup + daily report)
 # ============================================================
 
 def setup_scheduler():
@@ -1412,39 +1708,69 @@ def setup_scheduler():
         "interval", minutes=30,
         id="session_cleanup"
     )
+    scheduler.add_job(
+        run_daily_report_pipeline,
+        "cron", hour=8, minute=0,
+        timezone=eastern,
+        id="daily_report"
+    )
     scheduler.start()
-    logger.info("[SCHEDULER] Started — session cleanup every 30 min")
+    logger.info("[SCHEDULER] Started — session cleanup every 30 min, daily report at 8 AM ET")
     return scheduler
 
 # ============================================================
 # SECTION 12: GOOGLE CHAT MESSAGING
 # ============================================================
 
-def send_reply(space_name: str, text: str):
-    """Sends a text message back to the Google Chat space."""
+def send_reply(space_name: str, text: str, thread_name: str = None):
+    """
+    Sends a text message back to the Google Chat space.
+    In spaces (ROOM), pass thread_name to reply in-thread rather than posting a new message.
+    """
     message = chat_v1.Message()
     message.text = text
-    request = chat_v1.CreateMessageRequest(parent=space_name, message=message)
+    if thread_name:
+        message.thread = chat_v1.Thread(name=thread_name)
+        request = chat_v1.CreateMessageRequest(
+            parent=space_name,
+            message=message,
+            message_reply_option="REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
+        )
+    else:
+        request = chat_v1.CreateMessageRequest(parent=space_name, message=message)
     chat_client.create_message(request=request)
 
 def callback(message):
     """Triggered whenever a message arrives via Pub/Sub."""
     try:
         data = json.loads(message.data.decode("utf-8"))
-        user_text  = data.get("message", {}).get("text", "").strip()
-        space_name = data.get("message", {}).get("space", {}).get("name")
+        msg_data   = data.get("message", {})
+        user_text  = msg_data.get("text", "").strip()
+        space_name = msg_data.get("space", {}).get("name")
+        space_type = msg_data.get("space", {}).get("type", "")
+
+        # In spaces (ROOM), capture the thread so replies stay grouped
+        thread_name = msg_data.get("thread", {}).get("name") if space_type == "ROOM" else None
 
         if not user_text or not space_name:
             message.ack()
             return
 
-        logger.info(f"[RECEIVED] {user_text[:100]}")
+        # Strip @Mole mentions — Google Chat prepends these in spaces
+        user_text = re.sub(r"<users/\d+>", "", user_text)
+        user_text = re.sub(r"@mole\b", "", user_text, flags=re.IGNORECASE)
+        user_text = user_text.strip()
 
-        # Acknowledge immediately so the user knows the agent is working
-        send_reply(space_name, "⏳ Working on it...")
+        if not user_text:
+            message.ack()
+            return
+
+        logger.info(f"[RECEIVED] [{space_type or 'DM'}] {user_text[:100]}")
+
+        send_reply(space_name, "⏳ Working on it...", thread_name)
 
         ai_reply = process_ai_response(user_text, space_name)
-        send_reply(space_name, ai_reply)
+        send_reply(space_name, ai_reply, thread_name)
         logger.info(f"[SENT] {ai_reply[:100]}")
 
         message.ack()
