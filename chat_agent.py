@@ -1706,6 +1706,10 @@ Today: {today}. Timezone: America/New_York.
 
 def _run_claude_loop(messages: list, system_prompt: str, model: str, max_tokens: int) -> str:
     """Core Claude agentic tool-use loop — shared by both Haiku and Sonnet."""
+    # Anthropic requires conversations to end with a user message.
+    # Restored ChromaDB sessions can end on an assistant turn — trim if so.
+    if messages and messages[-1]["role"] == "assistant":
+        messages = messages[:-1]
     for _ in range(MAX_TOOL_ROUNDS):
         response = ai_client.messages.create(
             model=model,
