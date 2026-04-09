@@ -1790,21 +1790,10 @@ def setup_scheduler():
 # ============================================================
 
 def send_reply(space_name: str, text: str, thread_name: str = None):
-    """
-    Sends a text message back to the Google Chat space.
-    In spaces (ROOM), pass thread_name to reply in-thread rather than posting a new message.
-    """
+    """Sends a text message back to the Google Chat space as a new top-level message."""
     message = chat_v1.Message()
     message.text = text
-    if thread_name:
-        message.thread = chat_v1.Thread(name=thread_name)
-        request = chat_v1.CreateMessageRequest(
-            parent=space_name,
-            message=message,
-            message_reply_option="REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
-        )
-    else:
-        request = chat_v1.CreateMessageRequest(parent=space_name, message=message)
+    request = chat_v1.CreateMessageRequest(parent=space_name, message=message)
     chat_client.create_message(request=request)
 
 def callback(message):
